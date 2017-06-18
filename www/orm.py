@@ -6,7 +6,7 @@ import asyncio, logging
 import aiomysql
 
 def log(sql, args=()):
-    logging.log('SQL: %s' % sql)
+    logging.info('SQL: %s' % sql)
 
 async def create_pool(loop, **kw):
     logging.info('create database connection pool...')
@@ -16,13 +16,19 @@ async def create_pool(loop, **kw):
         port=kw.get('port', 3306),
         user=kw['user'],
         password=kw['password'],
-        db=kw['db'],
+        db=kw['database'],
         charset=kw.get('charset', 'utf8'),
-        autocommit=kw.get('autocommit', true),
+        autocommit=kw.get('autocommit', True),
         maxsize=kw.get('maxsize', 10),
         minsize=kw.get('minsize', 1),
         loop=loop
     )
+
+async def destory_pool():
+    global __pool
+    if __pool is not None:
+        __pool.close()
+        await __pool.wait_closed()
 
 async def select(sql, args, size=None):
     log(sql, args)
@@ -32,20 +38,20 @@ async def select(sql, args, size=None):
             #SQL语句的占位符是?, 而MySQL的占位符是%s, 需要替换
             await cur.execute(sql.replace('?', '%s'), args or ())
             if size: #传入了size，则获取最多指定数量的记录
-                rs = yield from cur.fetchmany(size)
+                rs = await cur.fetchmany(size)
             else: #获取所有记录
-                rs = yield from cur.fetchall()
+                rs = await cur.fetchall()
         loggin.info('rows returned: %s' % len(rs))
         return rs
 
-async def execute(sql, args, autocommit=true):
+async def execute(sql, args, autocommit=True):
     log(sql)
-    async with __pool.get() as coon:
+    async with __pool.get() as conn:
         if not autocommit:
             await coon.begin()
         try:
             async with conn.cursor(aiomysql.DictCursor) as cur:
-                yield from cur.execute(sql.replace('?', '%s'), args)
+                await cur.execute(sql.replace('?', '%s'), args)
                 affected = cur.rowcount
             if not autocommit:
                 await coon.commit()
@@ -69,10 +75,10 @@ class Field(object):
         self.name = name
         self.column_type = column_type
         self.primary_key = primary_key
-        self.default =default
+        self.default = default
 
     def __str__(self):
-        return '<%s, %s:%s> ' % self.__class__.__name__, self.column_type, self.name
+        return '<%s, %s:%s> ' % (self.__class__.__name__, self.column_type, self.name)
 
 #字符串字段属性
 class StringField(Field):
@@ -80,7 +86,7 @@ class StringField(Field):
         super().__init__(name, ddl, primary_key, default)
 
 class BooleanField(Field):
-    def __init__(self, name=None, default=None):
+    def __init__(self, name=None, default=False):
         super().__init__(name, 'boolean', False, default)
 
 class IntegerField(Field):
@@ -113,11 +119,11 @@ class ModelMetaclass(type):
                     #找到了主键
                     if primaryKey:
                         raise StandardError('重复的主键：%s' % k)
-                    primaryKey = v.primary_key
+                    primaryKey = k
                 else:
                     fields.append(k)
 
-        if not primaryKey:
+        if primaryKey is None:
             raise StandardError('没有主键！')
         for k in mappings.keys():
             attrs.pop(k)
@@ -129,7 +135,7 @@ class ModelMetaclass(type):
         attrs['__fields__'] = fields #除主键外属性名
         attrs['__select__'] = 'select `%s`, %s from %s' % (primaryKey, ','.join(escaped_fields), tableName)
         attrs['__insert__'] = 'insert into `%s` (%s, `%s`) values (%s)' % (tableName, ','.join(escaped_fields), primaryKey, create_args_string(len(escaped_fields) + 1))
-        attrs['__update__'] = 'update `%s`  set %s where `%s` = ?' % (tableName, ','.join(map(lambda f: '`%s`=?' ? (mapping.get(f).name or f), fields)))
+        attrs['__update__'] = 'update `%s`  set %s where `%s` = ?' % (tableName, ','.join(map(lambda f: '`%s`=?' % (mappings.get(f).name or f), fields)), primaryKey)
         attrs['__delete__'] = 'delete from `%s`' % (tableName)
         return type.__new__(cls, name, bases, attrs)
 
@@ -156,7 +162,7 @@ class Model(dict, metaclass=ModelMetaclass):
             field = self.__mapping__[key]
             if field.default is not None:
                 value = field.default() if callable(field.default) else field.default
-                logging.debug('使用默认值 %s: %s' % (key, str(value))
+                logging.debug('使用默认值 %s: %s' % (key, str(value)))
                 setattr(self, key, value)
         return value
 
@@ -186,7 +192,7 @@ class Model(dict, metaclass=ModelMetaclass):
             else:
                 raise ValueError('无效的limit值：%s' % str(limit))   
         rs = await select(' '.join(sql), args)
-        return [cls[**r] for r in rs]
+        return [cls(**r) for r in rs]
 
     @classmethod
     async def findNumber(cls, selectField, where=None, args=None):
